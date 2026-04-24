@@ -1,0 +1,228 @@
+# Deep Research AI Agent: System Design & Implementation
+
+Standard AI agents (like a simple Chatbot with a web-search tool) fail at *deep* research because they fall into loops, get distracted by irrelevant links, or hit context-window limits. 
+
+A **Deep Research Agent** requires a structured, multi-stage architecture that strictly delineates planning, recursive searching, evaluation, and synthesis. This design is highly scalable and mirrors advanced research architectures like Stanford's STORM.
+
+---
+
+## 1. High-Level Architecture (HLD)
+
+To build a deep research agent, we move away from a basic "ReAct" (Reason->Act) chat loop. Instead, we construct a **State Machine / Graph-based Architecture**. By organizing the agent into explicit states (or sub-agents), we enforce progress and prevent infinite loops.
+
+### Core Components
+1. **The Planner (Orchestrator):** Takes the initial prompt (e.g., "Analyze the impact of quantum computing on RSA") and breaks it into a structured outline and a set of diverse, distinct research questions.
+2. **The Crawler/Researcher (Worker):** Takes a single sub-question. Executes targeted Web Search APIs, reads the top N URLs, scrapes the text, and leverages an LLM to extract factual bullet points.
+3. **The Evaluator (Critic):** Reviews the extracted facts against the core query. If the information is insufficient or raises new follow-up questions, it seeds a new targeted query back to the Researcher. 
+4. **The Synthesizer (Writer):** Compiles all the structured facts (mapping facts to their source URLs) and generates a comprehensive, multi-page markdown report with citations.
+
+### Visual Architecture Workflow
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> Planner: Broad User Query
+    
+    state "Research Pipeline (Parallelizable)" as Research {
+        Planner --> QueryGeneration: Create Sub-topics
+        QueryGeneration --> WebSearch: Execute Tool (e.g. Tavily/Bing)
+        WebSearch --> WebScraping: Extract Raw HTML/Text
+        WebScraping --> FactExtraction: LLM prunes to core facts
+        FactExtraction --> Evaluator: Assess Information Completeness
+        
+        Evaluator --> QueryGeneration: Missing gaps (Recursive Deepening)
+    }
+
+    Evaluator --> Synthesizer: All Topics Complete \n (No Gaps)
+    Synthesizer --> [*]: Final Synthesized Report with Citations
+```
+
+---
+
+## 2. Low-Level Design (LLD)
+
+### Data Structures (State Management)
+To orchestrate a graph architecture, we must maintain a strict global **State** object passed iteratively between the nodes.
+
+```python
+class ResearchState:
+    topic: str
+    search_queries: list[str]   # Queue of queries to execute
+    visited_urls: set[str]      # Deduplication layer
+    extracted_facts: dict       # Facts grouped by source URL
+    depth: int                  # Current recursion depth
+    max_depth: int              # Limit to prevent runaway cloud costs
+```
+
+### Context Compression & Latency Optimization
+You cannot dump 20 scraped webpages into the final LLM context. 
+1. **Scraping Edge:** Use an API like Jina Reader (`https://r.jina.ai/URL`) which strips DOM elements and returns raw Markdown.
+2. **Immediate Compression:** Once scraped, do not store the raw text. Prompt an LLM instantly: *"Extract facts critically relevant to {query} from this text."* Store only the extracted facts.
+3. **Storage:** Keep these compressed facts in memory for a short report, or push them to a local SQLite/DuckDB index if the research is massive and spans hundreds of sites.
+
+---
+
+## 3. Core Implementation Framework (Python)
+
+Below is a robust, production-ready framework showing exact state transitions. In a real-world enterprise environment, you might wrap these concepts heavily inside [LangGraph](https://python.langchain.com/docs/langgraph/).
+
+```python
+import json
+import logging
+from typing import List, Dict, Set
+
+logging.basicConfig(level=logging.INFO)
+
+# ==========================================
+# 1. State Definition
+# ==========================================
+class ResearchState:
+    def __init__(self, main_topic: str, max_depth: int = 2):
+        self.main_topic = main_topic
+        self.pending_queries: List[str] = []
+        self.facts: List[Dict[str, str]] = []  # {"fact": str, "source": URL}
+        self.visited_urls: Set[str] = set()
+        self.current_depth: int = 1
+        self.max_depth: int = max_depth
+
+# ==========================================
+# 2. Tool Wrappers (Mocked)
+# ==========================================
+def tool_web_search(query: str) -> List[str]:
+    """Execute Search API (e.g. Tavily, Bing, Brave Search)"""
+    logging.info(f"[Tool: Search] {query}")
+    # Returns URLs matching the query
+    return [f"https://example.com/article_{query.replace(' ', '_')}"]
+
+def tool_scrape_page(url: str) -> str:
+    """Fetch structured markdown from URL"""
+    logging.info(f"[Tool: Scrape] {url}")
+    # Example: requests.get(f"https://r.jina.ai/{url}")
+    return f"Highly detailed mock content found at {url}..."
+
+# ==========================================
+# 3. LLM Abstraction
+# ==========================================
+def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False) -> str:
+    """Wrapper for OpenAI/Anthropic SDKs"""
+    # ... Real implementation calls the Model API ...
+    
+    # Mocking LLM outputs for demo purposes:
+    if "Plan" in system_prompt:
+         return '["History of quantum computing", "Current RSA vulnerabilities"]'
+    elif "Extract" in system_prompt:
+         return '["Shor\\'s algorithm poses a direct threat to RSA.", "Qubits are highly unstable."]'
+    elif "Evaluate" in system_prompt:
+         # Simulates if we need to search further based on facts vs topic
+         return '["What are lattice-based cryptography defenses?"]'
+    
+    return "# Deep Research Report\n\nSynthesis complete."
+
+# ==========================================
+# 4. State Machine Nodes (The Engine)
+# ==========================================
+
+def node_planner(state: ResearchState) -> ResearchState:
+    """Decomposes the broad topic into initial search vectors."""
+    sys_prompt = "You are an expert researcher. Break the user topic into 2-3 specific search engine queries. Return ONLY a JSON list of strings."
+    response = call_llm(sys_prompt, state.main_topic, json_mode=True)
+    state.pending_queries.extend(json.loads(response))
+    return state
+
+def node_researcher(state: ResearchState) -> ResearchState:
+    """Executes searches and parallel scraping for pending queries."""
+    
+    # Take a snapshot of queries to process in this depth step
+    queries_to_process = state.pending_queries.copy()
+    state.pending_queries.clear()
+    
+    for query in queries_to_process:
+        urls = tool_web_search(query)
+        
+        for url in urls[:3]: # Cap at 3 URLs per query
+            if url in state.visited_urls:
+                continue
+            
+            raw_text = tool_scrape_page(url)
+            state.visited_urls.add(url)
+            
+            # Immediately Extract & Compress to save Context Space
+            sys_prompt = f"Extract concise bullet point facts answering the query '{query}'. Rely ONLY on the text. Return a JSON list."
+            facts_response = call_llm(sys_prompt, raw_text, json_mode=True)
+            
+            facts = json.loads(facts_response)
+            for f in facts:
+                state.facts.append({"fact": f, "source": url})
+                
+    return state
+
+def node_evaluator(state: ResearchState) -> ResearchState:
+    """Checks for blindspots. Triggers deeper recursion if needed."""
+    if state.current_depth >= state.max_depth:
+        return state # Stop recursion
+    
+    sys_prompt = "Review the provided facts against the original topic. Identify any critical missing information. Formulate 1-2 NEW search queries to fill gaps. Return a JSON list."
+    
+    context = "\n".join([f"- {f['fact']}" for f in state.facts])
+    user_prompt = f"Topic: {state.main_topic}\nCurrent Facts:\n{context}"
+    
+    response = call_llm(sys_prompt, user_prompt, json_mode=True)
+    new_queries = json.loads(response)
+    
+    if new_queries:
+        logging.info(f"Evaluator requested deeper dive: {new_queries}")
+        state.pending_queries.extend(new_queries)
+        state.current_depth += 1
+        
+    return state
+
+def node_synthesizer(state: ResearchState) -> str:
+    """Compiles all extracted, verifiable facts into the final document."""
+    sys_prompt = "You are an expert technical author. Write a highly-detailed report based on the provided facts. Cite sources inline."
+    
+    # Prepare compressed context
+    context = "\n".join([f"- {item['fact']} (Source: {item['source']})" for item in state.facts])
+    user_prompt = f"Topic: {state.main_topic}\n\nVerified Facts:\n{context}\n\nOutput the final markdown report."
+    
+    return call_llm(sys_prompt, user_prompt)
+
+# ==========================================
+# 5. Core Execution Loop
+# ==========================================
+def run_deep_research(topic: str):
+    logging.info(f"### Starting Deep Research: {topic} ###")
+    state = ResearchState(main_topic=topic)
+    
+    logging.info("--- 🧠 PLANNING ---")
+    state = node_planner(state)
+    
+    # State Engine Loop
+    while state.pending_queries:
+        logging.info(f"--- 🕵️ RESEARCH & SCRAPE (Depth {state.current_depth}) ---")
+        state = node_researcher(state)
+        
+        logging.info("--- ⚖️ EVALUATION ---")
+        state = node_evaluator(state)
+        
+    logging.info("--- ✍️ SYNTHESIS ---")
+    final_report = node_synthesizer(state)
+    
+    print("\n\n" + final_report)
+    return final_report
+
+if __name__ == "__main__":
+    run_deep_research("The long-term viability of AI driven deep-sea mining")
+```
+
+---
+
+## 4. Scaling the Infrastructure
+
+To elevate this to a production-grade system supporting immense throughput:
+
+1. **Concurrency over Async:** The `node_researcher` loops sequentially in Python above for readability. Using Go's Goroutines or Python's `asyncio.gather()` would let you scrape 50 webpages concurrently in a fraction of the time.
+2. **Headless Scraping Resilience:** Basic requests fail immediately on modern websites due to Cloudflare Bot Protection or cookie consent walls. Implement a highly resilient proxy scraper like **Firecrawl**, **BrightData**, or **ZenRows** that executes JavaScript.
+3. **RAG-Backed Context for Synthesis:** If an agent extracts 20,000+ facts during a 4-hour deep dive, you physically cannot feed them all into the Synthesizer node at once. Instead:
+   - Chunk and store the extracted `state.facts` inside a localized vector database.
+   - When synthesizing the report, prompt the LLM to generate the outline first.
+   - For *each individual section* of the outline, query the Vector DB for the core facts directly relevant *only* to that section, appending it to the final markdown iteratively.

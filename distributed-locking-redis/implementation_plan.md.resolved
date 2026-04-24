@@ -1,0 +1,109 @@
+# Flash Sale with Redlock Implementation Plan
+
+Goal: Implement a highly available distributed locking mechanism using the Redlock algorithm for a Flash Sale scenario. This document updates the architectural approach and answers underlying design choices.
+
+## Architectural Deep Dive: Why Redlock?
+
+### The Flaw in Standard Redis Locks
+In a standard Redis master-replica setup, replication is **asynchronous**.
+1. Client A acquires a (`SETNX`) lock on the Redis Master.
+2. The Master crashes **before** syncing the lock over to the Replica.
+3. The Replica gets promoted to the new Master.
+4. Client B attempts to acquire the lock. Because the new Master doesn't have the key, it grants it to Client B.
+**Result:** Both Client A and Client B own the lock simultaneously, breaking **Mutual Exclusion**.
+
+Redlock solves this by using `N` (usually 3 or 5) *strictly independent* master nodes instead of depending on Master-Replica sync, requiring a consensus (majority).
+
+### How Redlock Works (Proper Steps)
+1. **Time Measure:** The client records the current time in milliseconds.
+2. **Scatter Request:** The client sequentially tries to acquire the lock across all `N` independent Redis instances using a command like `SET resource random_value NX PX 10000`. It uses a fractional local timeout per request to avoid hanging on a crashed node.
+3. **Consensus Test:** The client calculates the total elapsed time it took to query all nodes.
+4. **Acquired Decision:** The lock is successfully acquired **IF AND ONLY IF**:
+   - The client successfully locked the key in a **majority** of nodes (e.g., >= 2 out of 3).
+   - The total **elapsed time is less than** the lock's assigned validity time.
+5. **Effective Validity:** The *true* usable validity time of the lock is now `Initial Validity - Elapsed Time`.
+6. **Failure Recovery (Release):** If the lock failed (could not get majority, or took too long to vote), the client immediately sends an `UNLOCK` command to **ALL** nodes (even ones it thought it failed on). The UNLOCK uses a Lua script that checks if `random_value` matches to avoid unlocking someone else's lock.
+
+### Limitations of Redlock
+- **Hardware Clock Drift:** Redlock assumes basically synchronized clocks across nodes. If the clock on Node 1 leaps forward, it could expire the lock prematurely, allowing another client to establish a new quorum, breaking mutual exclusion.
+- **Process Pauses (GC/Networking):** If the Go application thread acquires the lock, then undergoes a prolonged Garbage Collection pause (or networking partition) longer than the lock's TTL, the lock naturally expires. When the GC pause completes, the Go thread mistakenly thinks it still holds the lock and proceeds to buy the item. (Mitigation: use monotonic Fencing Tokens in downstream DBs).
+- **Latency Overhead:** Acquiring a lock now takes multiple network roundtrips to 3-5 different machines instead of just 1.
+
+## Industry Standards for Flash Sales
+
+### 1. Lock Acquisition Failure: What's the standard?
+**The Standard:** `Fail-Fast (Drop Request)`
+In massive flash sales (e.g., 100,000 customers trying to buy 500 items at the exact same 12:00:00 mark), if you use **retries and backoffs**, you will create a catastrophic **Thundering Herd** problem that overwhelms your application servers and network bandwidth. 
+Because traffic is so heavy, the industry standard is to attempt to acquire the lock exactly once (or with a microscopic timeout limit). If it fails, you immediately return an HTTP 429 / "Due to high traffic, we could not process your request. Please try again." This sheds the load safely.
+
+### 2. Inventory Location: What's the standard?
+**The Standard:** `Pre-warm in Redis, Async flush to DB`.
+Traditional architectures hold stock in MySQL (`quantity = quantity - 1 WHERE quantity > 0`). This causes massive Row-Level Lock contention during a flash sale.
+Instead, the inventory (e.g., `500`) is placed in Redis as a dedicated key (e.g., `inventory:iphone:count`).
+When a user requests a purchase, you:
+1. `Acquire Redlock` (to protect the complex checkout validations).
+2. Check user eligibility (have they already bought one?).
+3. Atomically `DECR` the Redis inventory key. 
+4. `Release Redlock`.
+5. Drop an event on a queue (like Kafka) which asynchronously creates the actual Order entry in the Postgres/MySQL Database.
+
+## Code Snippets (go-redsync)
+
+Using the `github.com/go-redsync/redsync/v4` standard package:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"time"
+
+	goredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/go-redsync/redsync/v4"
+	"github.com/redis/go-redis/v9"
+)
+
+func main() {
+	// 1. Set up Redis DLM instances (3 Independent Masters)
+	redisNodeURLs := []string{"localhost:6379", "localhost:6380", "localhost:6381"}
+	var pools []redsync.Pool
+	for _, url := range redisNodeURLs {
+		client := redis.NewClient(&redis.Options{Addr: url})
+		pools = append(pools, goredis.NewPool(client))
+	}
+
+	// 2. Set up the RedLock client with the connection pools
+	rs := redsync.New(pools...)
+
+	// Define the distributed Mutex for our Flash Sale Item
+	mutexName := "flash_sale_lock:iphone15"
+	mutex := rs.NewMutex(mutexName, redsync.WithExpiry(8*time.Second))
+
+	// 3. Acquire the lock
+	// In a web handler: Fail-Fast if the lock cannot be instantly obtained.
+	// We handle lock acquisition failures here by rejecting the request.
+	if err := mutex.Lock(); err != nil {
+		log.Printf("Server Busy! Another user is currently transacting. Error: %v\n", err)
+		return // Industry Standard: Shed load, fail fast
+	}
+	
+	fmt.Println("Lock acquired successfully. Beginning Checkout Transaction...")
+
+	// Do Work: 
+	//   a) Verify user hasn't bought item already
+	//   b) Check Redis `inventory:iphone15` count > 0
+	//   c) `DECR` inventory
+	time.Sleep(1 * time.Second) // Simulate DB/Checkout latency
+
+	// 4. Release the lock
+	if ok, err := mutex.Unlock(); !ok || err != nil {
+		log.Fatalf("Critical anomaly: Failed to unlock: %v", err)
+	}
+
+	fmt.Println("Purchase completed, Lock Released.")
+}
+```
+
+## User Review Required
+- [ ] If you are satisfied with this detailed architectural design and logic, let me know and we will proceed to coding phase (creating the `main.go`, `docker-compose.yml`, and `go.mod`).
